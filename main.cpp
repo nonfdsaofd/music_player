@@ -3,6 +3,11 @@
 #define _WIN32_WINNT 0x0600
 #define _WIN32_IE 0x0700  // 补充IE兼容宏，确保Trackbar常量定义
 
+// 【关键修复】MinGW缺失MOD_NOREPEAT定义，手动补充
+#ifndef MOD_NOREPEAT
+#define MOD_NOREPEAT 0x4000  // Windows Vista+ 支持的防重复触发标志
+#endif
+
 // 【关键修复】手动定义MinGW缺失的EN_RETURN常量（编辑框回车通知码）
 #ifndef EN_RETURN
 #define EN_RETURN 0x0001
@@ -48,6 +53,9 @@ namespace fs = std::filesystem;
 #define ID_TIMER_PROG     1010  // 固定定时器ID（绑定窗口）
 #define IDC_EDIT_SEARCH   1011  // 搜索输入框
 #define IDC_BTN_SEARCH    1012  // 搜索按钮
+// 新增：全局快捷键ID
+#define ID_HOTKEY_PREV    2001  // Ctrl+左方向键（上一首）
+#define ID_HOTKEY_NEXT    2002  // Ctrl+右方向键（下一首）
 
 // 播放状态枚举
 enum PlayState {
@@ -78,7 +86,7 @@ HWND g_hSearchEdit = NULL;         // 新增：保存搜索编辑框句柄，用
 std::wstring g_searchKeyword;      // 当前搜索关键词
 
 // 【新增】默认窗口标题（统一管理）
-const std::wstring g_defaultWindowTitle = L"简易音乐播放器（UTF-16路径+MinGW兼容+单声道+搜索功能）";
+const std::wstring g_defaultWindowTitle = L"简易音乐播放器（UTF-16路径+MinGW兼容+单声道+搜索功能+全局快捷键）";
 
 // miniaudio相关全局变量
 ma_engine g_engine;
@@ -554,6 +562,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
         case WM_CREATE: {
             g_hMainWnd = hWnd; // 保存主窗口句柄
 
+            // 【核心修改】注册全局快捷键
+            // Ctrl+左方向键：上一首（MOD_NOREPEAT避免长按重复触发）
+            if (!RegisterHotKey(hWnd, ID_HOTKEY_PREV, MOD_CONTROL | MOD_NOREPEAT, VK_LEFT)) {
+                MessageBoxW(hWnd, L"注册上一首全局快捷键失败！\n可能被其他程序占用", L"警告", MB_ICONWARNING);
+            }
+            // Ctrl+右方向键：下一首
+            if (!RegisterHotKey(hWnd, ID_HOTKEY_NEXT, MOD_CONTROL | MOD_NOREPEAT, VK_RIGHT)) {
+                MessageBoxW(hWnd, L"注册下一首全局快捷键失败！\n可能被其他程序占用", L"警告", MB_ICONWARNING);
+            }
+
             // 【核心修改】启动音频引擎初始化线程
             g_audioInitThread = std::thread(InitAudioEngine);
 
@@ -643,6 +661,19 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
             CreateWindowW(L"BUTTON", L"随机播放", WS_CHILD | WS_VISIBLE | BS_RADIOBUTTON,
                 490, btnY, 80, 20, hWnd, (HMENU)IDC_RADIO_RANDOM, ((LPCREATESTRUCT)lParam)->hInstance, NULL);
 
+            break;
+        }
+
+        // 新增：处理全局快捷键消息
+        case WM_HOTKEY: {
+            switch (wParam) {
+                case ID_HOTKEY_PREV: // Ctrl+左方向键
+                    PrevMusic();
+                    break;
+                case ID_HOTKEY_NEXT: // Ctrl+右方向键
+                    NextMusic();
+                    break;
+            }
             break;
         }
 
@@ -803,6 +834,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
 
         // 窗口销毁：释放所有资源
         case WM_DESTROY: {
+            // 注销全局快捷键
+            UnregisterHotKey(hWnd, ID_HOTKEY_PREV);
+            UnregisterHotKey(hWnd, ID_HOTKEY_NEXT);
+
             DestroyProgressTimer();
             UninitCurrentSound();
             
