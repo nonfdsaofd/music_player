@@ -37,6 +37,9 @@
 #include <thread>       // 新增：std::thread头文件
 #include <mutex>        // 新增：互斥锁
 #include <condition_variable> // 新增：条件变量
+#include <chrono>       // 【随机种子修复】高精度时钟作为熵源
+#include <cstdint>
+#include <functional>   // std::hash
 
 namespace fs = std::filesystem;
 
@@ -104,8 +107,87 @@ std::thread g_audioInitThread;                 // 音频引擎初始化线程
 float g_totalDuration = 0.0f;       // 缓存当前播放音乐的总时长（秒）
 DWORD g_lastProgressUpdate = 0;     // 上次更新进度的时间戳（用于节流）
 
-// 随机数生成器
-std::mt19937 g_rng(std::random_device{}());
+// -------------------------- 随机数生成器（修复种子问题） --------------------------
+// 【问题】原代码：std::mt19937 g_rng(std::random_device{}());
+// 在 MinGW (libstdc++ for Windows) 上，std::random_device 并不真正从硬件熵源取值，
+// 而是退化为一个固定种子的伪随机数生成器。这会导致每次程序启动时 g_rng 的种子完全一样，
+// 产生的“随机”序列也完全一样 —— 即每次启动应用，随机播放的歌曲顺序都一模一样。
+//
+// 【修复】使用多熵源组合 + std::seed_seq 来初始化 mt19937：
+//   1. std::random_device     —— 标准熵源（在某些平台上有效，作为辅助）
+//   2. 高精度时钟（纳秒级）   —— 每次启动时间不同
+//   3. GetCurrentProcessId   —— Windows 进程 ID，每次启动不同
+//   4. GetCurrentThreadId    —— 线程 ID
+//   5. QueryPerformanceCounter —— Windows 高精度计时器，每次调用都不同
+//   6. 栈变量地址             —— ASLR 随机化后，地址每次启动都不同
+//   7. 堆地址 / 函数地址      —— 同样受 ASLR 影响
+// 只要任意一个熵源每次不同，整个种子就每次不同，从而保证随机序列不重复。
+static std::mt19937 CreateSecureRng() {
+    // 收集多个熵源
+    std::vector<std::uint32_t> entropy;
+
+    // 1. 标准随机设备（在 MinGW 上可能不可靠，但保留作为辅助）
+    try {
+        std::random_device rd;
+        for (int i = 0; i < 8; ++i) {
+            entropy.push_back(static_cast<std::uint32_t>(rd()));
+        }
+    } catch (...) {
+        // 某些平台可能抛异常，忽略
+    }
+
+    // 2. 高精度时钟（纳秒级时间戳）
+    const auto now = std::chrono::high_resolution_clock::now();
+    const auto ns = now.time_since_epoch();
+    const auto nsCount = static_cast<std::uint64_t>(ns.count());
+    entropy.push_back(static_cast<std::uint32_t>(nsCount & 0xFFFFFFFF));
+    entropy.push_back(static_cast<std::uint32_t>(nsCount >> 32));
+
+    // 3. Windows 进程 ID
+    entropy.push_back(static_cast<std::uint32_t>(GetCurrentProcessId()));
+
+    // 4. Windows 线程 ID
+    entropy.push_back(static_cast<std::uint32_t>(GetCurrentThreadId()));
+
+    // 5. Windows 高精度计时器（QueryPerformanceCounter）
+    LARGE_INTEGER qpc;
+    if (QueryPerformanceCounter(&qpc)) {
+        const std::uint64_t qpcVal = static_cast<std::uint64_t>(qpc.QuadPart);
+        entropy.push_back(static_cast<std::uint32_t>(qpcVal & 0xFFFFFFFF));
+        entropy.push_back(static_cast<std::uint32_t>(qpcVal >> 32));
+    }
+
+    // 6. 系统启动以来的毫秒数（GetTickCount 是另一个独立时间源）
+    entropy.push_back(static_cast<std::uint32_t>(GetTickCount()));
+
+    // 7. 栈变量地址（受 ASLR 影响，每次启动地址不同）
+    int stackVar = 0;
+    entropy.push_back(static_cast<std::uint32_t>(
+        reinterpret_cast<std::uintptr_t>(&stackVar) & 0xFFFFFFFF));
+
+    // 8. 堆地址（同样受 ASLR 影响）
+    void* heapVar = std::malloc(1);
+    if (heapVar) {
+        entropy.push_back(static_cast<std::uint32_t>(
+            reinterpret_cast<std::uintptr_t>(heapVar) & 0xFFFFFFFF));
+        std::free(heapVar);
+    }
+
+    // 9. 函数地址（受 ASLR 影响）
+    entropy.push_back(static_cast<std::uint32_t>(
+        reinterpret_cast<std::uintptr_t>(&CreateSecureRng) & 0xFFFFFFFF));
+
+    // 10. 额外混入字符串哈希（增加熵）
+    std::hash<std::thread::id> hasher;
+    entropy.push_back(static_cast<std::uint32_t>(
+        hasher(std::this_thread::get_id()) & 0xFFFFFFFF));
+
+    // 用 std::seed_seq 把所有熵源混合成 mt19937 的初始状态
+    std::seed_seq seq(entropy.begin(), entropy.end());
+    return std::mt19937(seq);
+}
+
+std::mt19937 g_rng = CreateSecureRng();
 
 // -------------------------- 提前声明函数（修复所有未声明错误） --------------------------
 std::wstring GetFileName(const std::wstring& wFullPath);
@@ -425,7 +507,10 @@ void NextMusic() {
         case LOOP_LIST: nextIndex = (g_curIndex + 1) % g_musicList.size(); break;
         case LOOP_RANDOM:
             if (g_musicList.size() > 1) {
-                do { nextIndex = g_rng() % g_musicList.size(); } while (nextIndex == g_curIndex);
+                // 【改进】使用 std::uniform_int_distribution 替代 % 运算，消除模偏差
+                const int n = static_cast<int>(g_musicList.size());
+                std::uniform_int_distribution<int> dist(0, n - 1);
+                do { nextIndex = dist(g_rng); } while (nextIndex == g_curIndex);
             } else { nextIndex = 0; }
             break;
     }
@@ -443,7 +528,10 @@ void PrevMusic() {
         case LOOP_LIST: prevIndex = (g_curIndex - 1 + g_musicList.size()) % g_musicList.size(); break;
         case LOOP_RANDOM:
             if (g_musicList.size() > 1) {
-                do { prevIndex = g_rng() % g_musicList.size(); } while (prevIndex == g_curIndex);
+                // 【改进】使用 std::uniform_int_distribution 替代 % 运算，消除模偏差
+                const int n = static_cast<int>(g_musicList.size());
+                std::uniform_int_distribution<int> dist(0, n - 1);
+                do { prevIndex = dist(g_rng); } while (prevIndex == g_curIndex);
             } else { prevIndex = 0; }
             break;
     }
